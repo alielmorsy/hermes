@@ -1028,32 +1028,10 @@ EqualityResult areEqualSmallNumbers(const double x, BigIntPrimitive *y) {
 /// ES11 7.2.15 Abstract Equality Comparison
 CallResult<bool>
 abstractEqualityTest_RJS(Runtime &runtime, Handle<> xHandle, Handle<> yHandle) {
-  // Fast path: handle common same-type comparisons without allocating
-  // MutableHandles, which avoids GCScope overhead for the frequent cases.
-  {
-    HermesValue xFast = xHandle.get();
-    HermesValue yFast = yHandle.get();
-    assert(
-        !xFast.isEmpty() && !yFast.isEmpty() && "invalid value for comparison");
-
-    // Both numbers: compare as doubles (handles NaN correctly).
-    if (LLVM_LIKELY(xFast.isNumber())) {
-      if (LLVM_LIKELY(yFast.isNumber()))
-        return xFast.getNumber() == yFast.getNumber();
-    } else if (xFast.getRaw() == yFast.getRaw()) {
-      // Identical non-number values are always equal: covers undefined===
-      // undefined, null===null, same bool, same object, same string pointer.
-      return true;
-    } else if (xFast.isNull() || xFast.isUndefined()) {
-      // null == undefined and undefined == null per ES11 7.2.15 steps 2-3.
-      // Also handles null != <non-null-non-undefined> and undefined !=
-      // <non-null-non-undefined>.
-      return yFast.isNull() || yFast.isUndefined();
-    } else if (yFast.isNull() || yFast.isUndefined()) {
-      // <non-null-non-undefined> != null and != undefined.
-      return false;
-    }
-  }
+  // Fast path: handle common comparisons without allocating MutableHandles,
+  // which avoids GCScope overhead for the frequent cases.
+  if (auto fastRes = abstractEqualityTestFast(*xHandle, *yHandle))
+    return *fastRes;
 
   MutableHandle<> x{runtime, xHandle.get()};
   MutableHandle<> y{runtime, yHandle.get()};
@@ -1960,10 +1938,8 @@ ordinaryHasInstance(Runtime &runtime, Handle<> constructor, Handle<> object) {
   }
 
   // 4. Let P be Get(C, "prototype").
-  auto propRes = JSObject::getNamed_RJS(
-      runtime.makeHandle(ctor),
-      runtime,
-      Predefined::getSymbolID(Predefined::prototype));
+  auto propRes =
+      runtime.getNamed(runtime.makeHandle(ctor), PropCacheID::Prototype);
   if (LLVM_UNLIKELY(propRes == ExecutionStatus::EXCEPTION)) {
     return ExecutionStatus::EXCEPTION;
   }
@@ -2025,6 +2001,19 @@ CallResult<bool> instanceOfOperator_RJS(
         "right operand of 'instanceof' is not an object");
   }
 
+  // Fast path: if C has no own @@hasInstance (known from its hidden class) and
+  // inherits directly from Function.prototype, GetMethod(C, @@hasInstance) is
+  // the non-writable, non-configurable Function.prototype[@@hasInstance],
+  // which is just a passthrough to ordinaryHasInstance.
+  // Note that the hidden class check must come first, since it ensures that C
+  // isn't a Proxy, which getParent() doesn't support.
+  JSObject *ctorObj = vmcast<JSObject>(*constructor);
+  if (runtime.noOwnHasInstanceClazz ==
+          CompressedPointer{ctorObj->getClassGCPtr()} &&
+      ctorObj->getParent(runtime) == runtime.functionPrototype.get()) {
+    return ordinaryHasInstance(runtime, constructor, object);
+  }
+
   // 2. Let instOfHandler be GetMethod(C,@@hasInstance).
   CallResult<PseudoHandle<>> instOfHandlerRes = JSObject::getNamed_RJS(
       Handle<JSObject>::vmcast(constructor),
@@ -2038,6 +2027,21 @@ CallResult<bool> instanceOfOperator_RJS(
           (*instOfHandlerRes)->getRaw() ==
           runtime.functionPrototypeSymbolHasInstance.getHermesValue()
               .getRaw())) {
+    // Remember C's hidden class for the fast path above, if it qualifies.
+    ctorObj = vmcast<JSObject>(*constructor);
+    if (!ctorObj->isProxyObject() && !ctorObj->isHostObject() &&
+        !ctorObj->isLazy() &&
+        ctorObj->getParent(runtime) == runtime.functionPrototype.get()) {
+      HiddenClass *clazz = ctorObj->getClass(runtime);
+      if (!clazz->isDictionary() &&
+          !HiddenClass::findPropertyNoAlloc(
+              clazz,
+              runtime,
+              Predefined::getSymbolID(Predefined::SymbolHasInstance))) {
+        runtime.noOwnHasInstanceClazz =
+            CompressedPointer{ctorObj->getClassGCPtr()};
+      }
+    }
     // functionPrototypeSymbolHasInstance is just a passthrough to
     // ordinaryHasInstance. Avoid the extra function call.
     return ordinaryHasInstance(runtime, constructor, object);

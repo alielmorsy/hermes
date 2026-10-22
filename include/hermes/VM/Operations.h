@@ -208,6 +208,25 @@ greaterEqualOp_RJS(Runtime &runtime, Handle<> leftHandle, Handle<> rightHandle);
 CallResult<bool>
 abstractEqualityTest_RJS(Runtime &runtime, Handle<> xHandle, Handle<> yHandle);
 
+/// Fast path of abstractEqualityTest_RJS for the cases that need no type
+/// conversion: two numbers, identical values, and comparisons involving null
+/// or undefined.
+inline OptValue<bool> abstractEqualityTestFast(HermesValue x, HermesValue y) {
+  assert(!x.isEmpty() && !y.isEmpty() && "invalid value for comparison");
+  if (LLVM_LIKELY(x.isNumber() && y.isNumber()))
+    return x.getNumber() == y.getNumber();
+  // Identical non-number values are always equal: covers same bool, same
+  // object, same string pointer, undefined == undefined and null == null.
+  if (x.getRaw() == y.getRaw())
+    return true;
+  // null and undefined are only equal to each other (ES11 7.2.15 steps 2-3).
+  bool xNullish = x.isNull() || x.isUndefined();
+  bool yNullish = y.isNull() || y.isUndefined();
+  if (xNullish || yNullish)
+    return xNullish && yNullish;
+  return llvh::None;
+}
+
 /// ES5.1 11.9.6
 bool strictEqualityTest(HermesValue x, HermesValue y);
 
