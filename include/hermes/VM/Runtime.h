@@ -129,7 +129,9 @@ static const unsigned STACK_RESERVE = SH_STACK_RESERVE;
 /// Type used to assign object unique integer identifiers.
 using ObjectID = uint32_t;
 
-#define PROP_CACHE_IDS(V) V(RegExpLastIndex, Predefined::lastIndex)
+#define PROP_CACHE_IDS(V)                   \
+  V(RegExpLastIndex, Predefined::lastIndex) \
+  V(Prototype, Predefined::prototype)
 
 /// Fixed set of ids used by the property cache in Runtime.
 enum class PropCacheID {
@@ -903,6 +905,13 @@ class Runtime : public RuntimeBase, public HandleRootOwner {
       SmallHermesValue hv);
 
   /// @}
+
+  /// Hidden class of a constructor recently seen by instanceof, which has no
+  /// own @@hasInstance property. Only non-dictionary classes are stored, since
+  /// their set of properties can't change. If an object with this class has
+  /// Function.prototype as its [[Prototype]], its @@hasInstance is the
+  /// non-writable, non-configurable Function.prototype[@@hasInstance].
+  WeakRoot<HiddenClass> noOwnHasInstanceClazz{nullptr};
 
 #define RUNTIME_HV_FIELD(name, type) PinnedValue<type> name{};
 #include "hermes/VM/RuntimeHermesValueFields.def"

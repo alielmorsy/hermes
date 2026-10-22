@@ -356,18 +356,22 @@ static inline const Inst *nextInstCall(const Inst *ip) {
   constexpr auto firstCall = std::min({
 #define DEFINE_RET_TARGET(name) static_cast<uint8_t>(OpCode::name),
 #include "hermes/BCGen/HBC/BytecodeList.def"
+
   });
   constexpr auto lastCall = std::max({
 #define DEFINE_RET_TARGET(name) static_cast<uint8_t>(OpCode::name),
 #include "hermes/BCGen/HBC/BytecodeList.def"
+
   });
   constexpr auto minSize = std::min({
 #define DEFINE_RET_TARGET(name) sizeof(inst::name##Inst),
 #include "hermes/BCGen/HBC/BytecodeList.def"
+
   });
   constexpr auto maxSize = std::max({
 #define DEFINE_RET_TARGET(name) sizeof(inst::name##Inst),
 #include "hermes/BCGen/HBC/BytecodeList.def"
+
   });
 
   constexpr uint32_t W = 2;
@@ -1018,6 +1022,11 @@ tailCall:
 /// \param falseDest  ip value if the conditional evaluates to false
 #define JCOND_EQ_IMPL(name, suffix, trueDest, falseDest) \
   CASE(name##suffix) {                                   \
+    if (auto fastRes = abstractEqualityTestFast(         \
+            O2REG(name##suffix), O3REG(name##suffix))) { \
+      ip = *fastRes ? trueDest : falseDest;              \
+      DISPATCH;                                          \
+    }                                                    \
     CAPTURE_IP_ASSIGN(                                   \
         auto eqRes,                                      \
         abstractEqualityTest_RJS(                        \
@@ -2231,6 +2240,43 @@ tailCall:
 
       CASE(PutByValLoose)
       CASE(PutByValStrict) {
+        // Fast path: overwrite an existing element of an array or a typed
+        // array. This mirrors the fast path at the start of
+        // JSObject::putComputedWithReceiver_RJS, without the calls through
+        // the object vtable.
+        if (LLVM_LIKELY(O1REG(PutByValLoose).isObject())) {
+          auto *obj = vmcast<JSObject>(O1REG(PutByValLoose));
+          auto arrayIndex = toArrayIndexFastPath(O2REG(PutByValLoose));
+          if (arrayIndex && obj->hasFastIndexProperties()) {
+            if (vmisa<ArrayImpl>(obj)) {
+              auto *arr = vmcast<ArrayImpl>(obj);
+              uint32_t rel = *arrayIndex - arr->getBeginIndex();
+              if (LLVM_LIKELY(
+                      !arr->getFlags().frozen && rel < arr->getElemCount() &&
+                      !arr->getIndexedStorageUnsafe(runtime)
+                           ->at(rel)
+                           .isEmpty())) {
+                // Encoding may allocate, so re-read the array afterwards.
+                ENCODE_HV_AS_SHV(shv, O3REG(PutByValLoose));
+                vmcast<ArrayImpl>(O1REG(PutByValLoose))
+                    ->getIndexedStorageUnsafe(runtime)
+                    ->set(rel, shv, runtime.getHeap());
+                ip = NEXTINST(PutByValLoose);
+                DISPATCH;
+              }
+            } else if (JSTypedArrayBase::isNoAllocTypedArray(obj)) {
+              auto *ta = vmcast<JSTypedArrayBase>(obj);
+              if (LLVM_LIKELY(
+                      O3REG(PutByValLoose).isNumber() &&
+                      *arrayIndex < ta->getLength() && ta->attached(runtime))) {
+                JSTypedArrayBase::polyWriteNoAlloc(
+                    ta, runtime, *arrayIndex, O3REG(PutByValLoose));
+                ip = NEXTINST(PutByValLoose);
+                DISPATCH;
+              }
+            }
+          }
+        }
         CAPTURE_IP_ASSIGN(
             ExecutionStatus status, casePutByVal(runtime, frameRegs, ip));
         if (LLVM_UNLIKELY(status == ExecutionStatus::EXCEPTION))
@@ -2916,6 +2962,12 @@ tailCall:
 
       CASE(Eq)
       CASE(Neq) {
+        if (auto fastRes = abstractEqualityTestFast(O2REG(Eq), O3REG(Eq))) {
+          O1REG(Eq) = HermesValue::encodeBoolValue(
+              ip->opCode == OpCode::Eq ? *fastRes : !*fastRes);
+          ip = NEXTINST(Eq);
+          DISPATCH;
+        }
         CAPTURE_IP_ASSIGN(
             auto eqRes,
             abstractEqualityTest_RJS(

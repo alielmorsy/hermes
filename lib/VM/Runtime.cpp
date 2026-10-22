@@ -189,12 +189,11 @@ CallResult<PseudoHandle<>> Runtime::getNamed(
   }
   auto sym = Predefined::getSymbolID(fixedPropCacheNames[static_cast<int>(id)]);
   NamedPropertyDescriptor desc;
-  // Check writable and internalSetter flags since the cache slot is shared for
-  // get/put.
+  // The writable and internalSetter flags only affect writes, which use the
+  // separate fixedWritePropCache_, so any own data property can be cached.
   OptValue<bool> hasOwnProp =
       JSObject::tryGetOwnNamedDescriptorFast(*obj, *this, sym, desc);
-  if (LLVM_LIKELY(hasOwnProp && *hasOwnProp) && !desc.flags.accessor &&
-      desc.flags.writable && !desc.flags.internalSetter) {
+  if (LLVM_LIKELY(hasOwnProp && *hasOwnProp) && !desc.flags.accessor) {
     HiddenClass *clazz = vmcast<HiddenClass>(clazzPtr.getNonNull(*this));
     if (LLVM_LIKELY(
             !clazz->isDictionaryNoCache() &&
@@ -797,6 +796,7 @@ void Runtime::markWeakRoots(WeakRootAcceptor &acceptor, bool markLongLived) {
           "negMatchClazz is always zero for non-JS code property cache");
       acceptor.acceptWeak(entry.clazz);
     }
+    acceptor.acceptWeak(noOwnHasInstanceClazz);
   }
   for (auto &registry : finalizationRegistries_) {
     acceptor.acceptWeak(registry);
